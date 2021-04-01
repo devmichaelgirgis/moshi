@@ -12,6 +12,7 @@ lib
 target
 pom.xml.*
 release.properties
+dependency-reduced-pom.xml
 
 .idea
 *.iml
@@ -22,3 +23,8 @@ classes
 obj
 
 .DS_Store
+
+.gradle
+
+# Temporary until generating a docsite
+docs/

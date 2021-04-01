@@ -5,7 +5,7 @@
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ *    https://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -35,27 +35,33 @@ public final class DefaultOnDataMismatchAdapter<T> extends JsonAdapter<T> {
     this.defaultValue = defaultValue;
   }
 
-  @Override public T fromJson(JsonReader reader) throws IOException {
-    // Read the value first so that the reader will be in a known state even if there's an
-    // exception. Otherwise it may be awkward to recover: it might be between calls to
-    // beginObject() and endObject() for example.
-    Object jsonValue = reader.readJsonValue();
-
-    // Use the delegate to convert the JSON value to the target type.
+  @Override
+  public T fromJson(JsonReader reader) throws IOException {
+    // Use a peeked reader to leave the reader in a known state even if there's an exception.
+    JsonReader peeked = reader.peekJson();
+    T result;
     try {
-      return delegate.fromJsonValue(jsonValue);
+      // Attempt to decode to the target type with the peeked reader.
+      result = delegate.fromJson(peeked);
     } catch (JsonDataException e) {
-      return defaultValue;
+      result = defaultValue;
+    } finally {
+      peeked.close();
     }
+    // Skip the value back on the reader, no matter the state of the peeked reader.
+    reader.skipValue();
+    return result;
   }
 
-  @Override public void toJson(JsonWriter writer, T value) throws IOException {
+  @Override
+  public void toJson(JsonWriter writer, T value) throws IOException {
     delegate.toJson(writer, value);
   }
 
   public static <T> Factory newFactory(final Class<T> type, final T defaultValue) {
     return new Factory() {
-      @Override public @Nullable JsonAdapter<?> create(
+      @Override
+      public @Nullable JsonAdapter<?> create(
           Type requestedType, Set<? extends Annotation> annotations, Moshi moshi) {
         if (type != requestedType) return null;
         JsonAdapter<T> delegate = moshi.nextAdapter(this, type, annotations);

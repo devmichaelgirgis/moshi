@@ -5,7 +5,7 @@
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ *    https://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -16,19 +16,25 @@
 package com.squareup.moshi.kotlin.codegen
 
 import com.google.auto.service.AutoService
-import com.squareup.kotlinpoet.TypeSpec
+import com.squareup.kotlinpoet.AnnotationSpec
+import com.squareup.kotlinpoet.ClassName
+import com.squareup.kotlinpoet.classinspector.elements.ElementsClassInspector
 import com.squareup.moshi.JsonClass
-import me.eugeniomarletti.kotlin.metadata.KotlinMetadataUtils
-import me.eugeniomarletti.kotlin.metadata.declaresDefaultValue
-import me.eugeniomarletti.kotlin.processing.KotlinAbstractProcessor
-import java.io.File
+import com.squareup.moshi.kotlin.codegen.api.AdapterGenerator
+import com.squareup.moshi.kotlin.codegen.api.PropertyGenerator
+import net.ltgt.gradle.incap.IncrementalAnnotationProcessor
+import net.ltgt.gradle.incap.IncrementalAnnotationProcessorType.ISOLATING
+import javax.annotation.processing.AbstractProcessor
+import javax.annotation.processing.Filer
+import javax.annotation.processing.Messager
 import javax.annotation.processing.ProcessingEnvironment
 import javax.annotation.processing.Processor
 import javax.annotation.processing.RoundEnvironment
 import javax.lang.model.SourceVersion
-import javax.lang.model.element.Element
 import javax.lang.model.element.TypeElement
-import javax.tools.Diagnostic.Kind.ERROR
+import javax.lang.model.util.Elements
+import javax.lang.model.util.Types
+import javax.tools.Diagnostic
 
 /**
  * An annotation processor that reads Kotlin data classes and generates Moshi JsonAdapters for them.
@@ -37,14 +43,12 @@ import javax.tools.Diagnostic.Kind.ERROR
  *
  * The generated class will match the visibility of the given data class (i.e. if it's internal, the
  * adapter will also be internal).
- *
- * If you define a companion object, a jsonAdapter() extension function will be generated onto it.
- * If you don't want this though, you can use the runtime [JsonClass] factory implementation.
  */
 @AutoService(Processor::class)
-class JsonClassCodegenProcessor : KotlinAbstractProcessor(), KotlinMetadataUtils {
+@IncrementalAnnotationProcessor(ISOLATING)
+public class JsonClassCodegenProcessor : AbstractProcessor() {
 
-  companion object {
+  public companion object {
     /**
      * This annotation processing argument can be specified to have a `@Generated` annotation
      * included in the generated code. It is not encouraged unless you need it for static analysis
@@ -54,60 +58,110 @@ class JsonClassCodegenProcessor : KotlinAbstractProcessor(), KotlinMetadataUtils
      *   * `"javax.annotation.processing.Generated"` (JRE 9+)
      *   * `"javax.annotation.Generated"` (JRE <9)
      */
-    const val OPTION_GENERATED = "moshi.generated"
-    private val POSSIBLE_GENERATED_NAMES = setOf(
-        "javax.annotation.processing.Generated",
-        "javax.annotation.Generated"
-    )
+    public const val OPTION_GENERATED: String = "moshi.generated"
+    private val POSSIBLE_GENERATED_NAMES = arrayOf(
+      ClassName("javax.annotation.processing", "Generated"),
+      ClassName("javax.annotation", "Generated")
+    ).associateBy { it.canonicalName }
   }
 
+  private lateinit var types: Types
+  private lateinit var elements: Elements
+  private lateinit var filer: Filer
+  private lateinit var messager: Messager
+  private lateinit var cachedClassInspector: MoshiCachedClassInspector
   private val annotation = JsonClass::class.java
-  private var generatedType: TypeElement? = null
+  private var generatedType: ClassName? = null
 
-  override fun getSupportedAnnotationTypes() = setOf(annotation.canonicalName)
+  override fun getSupportedAnnotationTypes(): Set<String> = setOf(annotation.canonicalName)
 
   override fun getSupportedSourceVersion(): SourceVersion = SourceVersion.latest()
 
-  override fun getSupportedOptions() = setOf(OPTION_GENERATED)
+  override fun getSupportedOptions(): Set<String> = setOf(OPTION_GENERATED)
 
   override fun init(processingEnv: ProcessingEnvironment) {
     super.init(processingEnv)
     generatedType = processingEnv.options[OPTION_GENERATED]?.let {
-      if (it !in POSSIBLE_GENERATED_NAMES) {
-        throw IllegalArgumentException("Invalid option value for $OPTION_GENERATED. Found $it, " +
-            "allowable values are $POSSIBLE_GENERATED_NAMES.")
-      }
-      processingEnv.elementUtils.getTypeElement(it)
+      POSSIBLE_GENERATED_NAMES[it] ?: error(
+        "Invalid option value for $OPTION_GENERATED. Found $it, " +
+          "allowable values are $POSSIBLE_GENERATED_NAMES."
+      )
     }
+    this.types = processingEnv.typeUtils
+    this.elements = processingEnv.elementUtils
+    this.filer = processingEnv.filer
+    this.messager = processingEnv.messager
+    cachedClassInspector = MoshiCachedClassInspector(ElementsClassInspector.create(elements, types))
   }
 
   override fun process(annotations: Set<TypeElement>, roundEnv: RoundEnvironment): Boolean {
+    if (roundEnv.errorRaised()) {
+      // An error was raised in the previous round. Don't try anything for now to avoid adding
+      // possible more noise.
+      return false
+    }
     for (type in roundEnv.getElementsAnnotatedWith(annotation)) {
+      if (type !is TypeElement) {
+        messager.printMessage(
+          Diagnostic.Kind.ERROR,
+          "@JsonClass can't be applied to $type: must be a Kotlin class",
+          type
+        )
+        continue
+      }
       val jsonClass = type.getAnnotation(annotation)
-      if (jsonClass.generateAdapter) {
-        val generator = adapterGenerator(type) ?: continue
-        generator.generateAndWrite(generatedType)
+      if (jsonClass.generateAdapter && jsonClass.generator.isEmpty()) {
+        val generator = adapterGenerator(type, cachedClassInspector) ?: continue
+        val preparedAdapter = generator
+          .prepare { spec ->
+            spec.toBuilder()
+              .apply {
+                @Suppress("DEPRECATION") // This is a Java type
+                generatedType?.let { generatedClassName ->
+                  addAnnotation(
+                    AnnotationSpec.builder(generatedClassName)
+                      .addMember(
+                        "value = [%S]",
+                        JsonClassCodegenProcessor::class.java.canonicalName
+                      )
+                      .addMember("comments = %S", "https://github.com/square/moshi")
+                      .build()
+                  )
+                }
+              }
+              .addOriginatingElement(type)
+              .build()
+          }
+
+        preparedAdapter.spec.writeTo(filer)
+        preparedAdapter.proguardConfig?.writeTo(filer, type)
       }
     }
 
     return false
   }
 
-  private fun adapterGenerator(element: Element): AdapterGenerator? {
-    val type = TargetType.get(messager, elementUtils, typeUtils, element) ?: return null
+  private fun adapterGenerator(
+    element: TypeElement,
+    cachedClassInspector: MoshiCachedClassInspector
+  ): AdapterGenerator? {
+    val type = targetType(messager, elements, types, element, cachedClassInspector) ?: return null
 
     val properties = mutableMapOf<String, PropertyGenerator>()
     for (property in type.properties.values) {
-      val generator = property.generator(messager)
+      val generator = property.generator(messager, element, elements)
       if (generator != null) {
         properties[property.name] = generator
       }
     }
 
     for ((name, parameter) in type.constructor.parameters) {
-      if (type.properties[parameter.name] == null && !parameter.proto.declaresDefaultValue) {
+      if (type.properties[parameter.name] == null && !parameter.hasDefault) {
         messager.printMessage(
-            ERROR, "No property for required constructor parameter $name", parameter.element)
+          Diagnostic.Kind.ERROR,
+          "No property for required constructor parameter $name",
+          element
+        )
         return null
       }
     }
@@ -122,19 +176,5 @@ class JsonClassCodegenProcessor : KotlinAbstractProcessor(), KotlinMetadataUtils
     }
 
     return AdapterGenerator(type, sortedProperties)
-  }
-
-  private fun AdapterGenerator.generateAndWrite(generatedOption: TypeElement?) {
-    val fileSpec = generateFile(generatedOption)
-    val adapterName = fileSpec.members.filterIsInstance<TypeSpec>().first().name!!
-    val outputDir = generatedDir ?: mavenGeneratedDir(adapterName)
-    fileSpec.writeTo(outputDir)
-  }
-
-  private fun mavenGeneratedDir(adapterName: String): File {
-    // Hack since the maven plugin doesn't supply `kapt.kotlin.generated` option
-    // Bug filed at https://youtrack.jetbrains.com/issue/KT-22783
-    val file = filer.createSourceFile(adapterName).toUri().let(::File)
-    return file.parentFile.also { file.delete() }
   }
 }

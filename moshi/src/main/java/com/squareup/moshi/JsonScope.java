@@ -17,8 +17,7 @@ package com.squareup.moshi;
 
 /** Lexical scoping elements within a JSON reader or writer. */
 final class JsonScope {
-  private JsonScope() {
-  }
+  private JsonScope() {}
 
   /** An array with no elements requires no separators or newlines before it is closed. */
   static final int EMPTY_ARRAY = 1;
@@ -43,6 +42,9 @@ final class JsonScope {
 
   /** A document that's been closed and cannot be accessed. */
   static final int CLOSED = 8;
+
+  /** Sits above the actual state to indicate that a value is currently being streamed in. */
+  static final int STREAMING_VALUE = 9;
 
   /**
    * Renders the path in a JSON document to a string. The {@code pathNames} and {@code pathIndices}
